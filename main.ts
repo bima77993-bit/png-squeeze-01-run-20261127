@@ -1,9 +1,10 @@
-// png-squeeze-01-run-20261127 entry v2.
+// png-squeeze-01-run-20261127 entry v3.
 // Self-contained Node 22 program (built-in modules only). Reads /input/<id>/image.png
 // (1280x720 RGBA stored PNG), writes /output/<id>/image.png losslessly, as small as
 // possible. Pipeline: decode -> colour-type/palette screen -> per-row filter choice
 // -> zopfli-faithful DEFLATE (hash-chain match finder + multi-candidate DP +
-// length-limited Huffman, katajainen). Deterministic: no clock, no env, work-budgeted.
+// length-limited Huffman, katajainen) with a soft-good chain prune. Deterministic:
+// no clock, no env, work-budgeted.
 // PNG codec + screen adapted from the kit's program/generator/subject/{png,scale}.mjs
 // (make.fun, MIT). The DEFLATE below is original work (faithful port of the zopfli
 // algorithm's structure: lazy greedy + iterative DP + dynamic/fixed block choice).
@@ -603,7 +604,7 @@ class BitWriter2 {
 // Per position, steps are (endLen, dist) pairs; the interval (prevEnd, endLen]
 // has sublen = dist (best/shortest distance for each length in it).
 // This is ZopfliFindLongestMatch's sublen, recorded once per stream.
-function precomputeSteps(data, chainLimit, goodLen, fruitlessLimit) {
+function precomputeSteps(data, chainLimit, goodLen, fruitlessLimit, o) {
   const n = data.length;
   const head = new Int32Array(HASH_SIZE).fill(-1);
   const prev = new Int32Array(n);
@@ -611,7 +612,22 @@ function precomputeSteps(data, chainLimit, goodLen, fruitlessLimit) {
   for (let i = n - 1; i >= 0; i--) {
     run[i] = (i + 1 < n && data[i] === data[i + 1]) ? Math.min(run[i + 1] + 1, 65535) : 1;
   }
-  const hashAt = (i) => ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & HASH_MASK;
+  // o (optional): { maxDist, grace, propGrace, stats }
+  //   maxDist: break the chain walk once dist = i - cur exceeds it
+  //     (chain is newest-first, so dist only grows -> a clean early exit).
+  //   grace: after bestLen first reaches goodLen, walk at most `grace` more
+  //     chain entries before stopping (a soft "good": keeps looking for a
+  //     longer match briefly instead of the hard break that cost bits).
+  //   propGrace: if set, the grace is max(grace, bestLen / propGrace) --
+  //     longer matches get more room to find an even longer one (where the
+  //     bits are), short matches get the fixed grace.
+  //   stats: object filled with counters (chainIters, quickPass, computed,
+  //     bestGe32, bestGe64, bestGe128, graceStops, distStops).
+  const maxDist = o && o.maxDist ? o.maxDist : 0;
+  const grace = o && o.grace ? o.grace : 0;
+  const propGrace = o && o.propGrace ? o.propGrace : 0;
+  const stats = o && o.stats ? o.stats : null;
+  let chainIters = 0, quickPass = 0, computed = 0, bestGe32 = 0, bestGe64 = 0, bestGe128 = 0, graceStops = 0, distStops = 0;
   let cap = 1 << 20;
   let stepLen = new Uint16Array(cap);
   let stepDist = new Int32Array(cap);
@@ -625,47 +641,56 @@ function precomputeSteps(data, chainLimit, goodLen, fruitlessLimit) {
   let inserted = 0;
   for (let i = 0; i < n; i++) {
     off[i] = stepCount;
+    // Insert position i-1 (only one per iteration; the while form is kept
+    // for safety but executes at most once here).
     while (inserted < i) {
       if (inserted + 2 < n) {
-        const h = hashAt(inserted);
+        // Inlined hashAt(inserted): ((d0<<10)^(d1<<5)^d2) & HASH_MASK.
+        const h = ((data[inserted] << 10) ^ (data[inserted + 1] << 5) ^ data[inserted + 2]) & HASH_MASK;
         prev[inserted] = head[h];
         head[h] = inserted;
       }
       inserted++;
     }
     if (i + MIN_MATCH > n) continue;
-    const h = hashAt(i);
+    const h = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & HASH_MASK;
     let cur = head[h];
     const limit = i > WSIZE ? i - WSIZE : 0;
     const maxLen = Math.min(MAX_MATCH, n - i);
     let bestLen = 2;
     let chain = 0;
     let sinceImprove = 0;
+    let stopAt = Infinity;
     const same0 = run[i] - 1;
-    while (cur >= limit && chain < chainLimit) {
+    while (cur >= limit && chain < chainLimit && chain < stopAt) {
       chain++;
+      if (stats) chainIters++;
+      if (maxDist > 0 && i - cur > maxDist) { if (stats) distStops++; break; }
       // Quick check first: the byte at bestLen must match, else this
-      // candidate cannot beat the current best (no maxCmp needed here).
+      // candidate cannot beat the current best.
       if (bestLen >= MIN_MATCH && data[cur + bestLen] !== data[i + bestLen]) {
         if (fruitlessLimit > 0) {
           if (++sinceImprove >= fruitlessLimit) break;
         }
         cur = prev[cur]; continue;
       }
-      const maxCmp = maxLen < n - cur ? maxLen : n - cur;
-      if (bestLen >= maxCmp) { cur = prev[cur]; continue; }
+      if (stats) quickPass++;
+      // NOTE: maxCmp is always maxLen here: cur < i so n - cur > n - i >=
+      // maxLen. The ternary in oz2 was redundant; dropped.
+      if (bestLen >= maxLen) { cur = prev[cur]; continue; }
+      if (stats) computed++;
       let len = 0;
       if (same0 > 2 && data[cur] === data[i]) {
         let skip = same0;
         const s1 = run[cur] - 1;
         if (s1 < skip) skip = s1;
-        if (skip > maxCmp) skip = maxCmp;
+        if (skip > maxLen) skip = maxLen;
         len = skip;
       }
-      while (len + 4 <= maxCmp &&
+      while (len + 4 <= maxLen &&
         data[cur + len] === data[i + len] && data[cur + len + 1] === data[i + len + 1] &&
         data[cur + len + 2] === data[i + len + 2] && data[cur + len + 3] === data[i + len + 3]) len += 4;
-      while (len < maxCmp && data[cur + len] === data[i + len]) len++;
+      while (len < maxLen && data[cur + len] === data[i + len]) len++;
       if (len > bestLen) {
         if (stepCount === cap) grow();
         stepLen[stepCount] = len;
@@ -674,14 +699,32 @@ function precomputeSteps(data, chainLimit, goodLen, fruitlessLimit) {
         bestLen = len;
         sinceImprove = 0;
         if (len >= maxLen) break;
-        if (len >= goodLen) break;
+        if (len >= goodLen) {
+          if (grace > 0) {
+            // Fixed grace: set the stop point ONCE (first good match) and
+            // never extend it. Extending it (propGrace) recovers the bits
+            // but loses the whole time saving -- rejected.
+            if (stopAt === Infinity) stopAt = chain + grace;
+          } else break;
+        }
       } else if (fruitlessLimit > 0 && bestLen >= MIN_MATCH) {
         if (++sinceImprove >= fruitlessLimit) break;
       }
       cur = prev[cur];
     }
+    if (stats) {
+      if (chain >= stopAt) graceStops++;
+      if (bestLen >= 32) bestGe32++;
+      if (bestLen >= 64) bestGe64++;
+      if (bestLen >= 128) bestGe128++;
+    }
   }
   off[n] = stepCount;
+  if (stats) {
+    stats.chainIters = chainIters; stats.quickPass = quickPass; stats.computed = computed;
+    stats.bestGe32 = bestGe32; stats.bestGe64 = bestGe64; stats.bestGe128 = bestGe128;
+    stats.graceStops = graceStops; stats.distStops = distStops; stats.steps = stepCount;
+  }
   return { off, len: stepLen.subarray(0, stepCount), dist: stepDist.subarray(0, stepCount), n };
 }
 
@@ -1056,7 +1099,7 @@ function deflateZopfli(data, opts = {}) {
     return bw.buf.subarray(0, bw.pos);
   }
   const blockSize = opts.blockSize ?? 262144;
-  const steps = precomputeSteps(data, opts.chain ?? 256, opts.good ?? 258, opts.fruitless ?? 0);
+  const steps = precomputeSteps(data, opts.chain ?? 256, opts.good ?? 258, opts.fruitless ?? 0, opts);
   const bw = new BitWriter2(data.length + 16384);
   bw.buf[bw.pos++] = 0x78;
   bw.buf[bw.pos++] = 0x9c;
@@ -1103,11 +1146,16 @@ function verifyDeflate2(data, stream) {
 // ---------- Main ----------
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-// oz2: faithful zopfli port. chain=192, iters=1, block 256KB, DP mode 'all'.
-// Time-budgeted: chain=192 (vs 256) saves ~3 s across the set for ~1.6k points,
-// keeping the worst held-out set (~40 s local) inside the 60 s server limit.
-// iters=1 costs ~+270 B on i002 vs iters=2 but saves ~9 s. Best-of(zlib9, oz2).
-const DEFLATE_OPTS = { chain: 192, iters: 1, good: 258, blockSize: 262144, mode: 'all' };
+// oz3: faithful zopfli port + soft-good chain prune. chain=240, iters=2,
+// block 256KB, DP mode 'all'. The soft good (good=64, grace=16) stops the
+// hash-chain walk 16 entries after the first match >= 64 -- this buys the
+// time for chain=240 + iters=2 inside the 60 s server limit, at a cost of
+// ~1.5k B vs the unpruned chain=256/iters=2. chain=240 (not 256): the h2
+// held-out set is ~3.6 s faster at chain=240 for ~0.2 pts on practice,
+// keeping the worst set ~40 s local (safe at 1.46x server slowdown).
+// Practice ~739k local (v2: 735,263); worst held-out set ~40 s local.
+// Best-of(zlib9, oz3).
+const DEFLATE_OPTS = { chain: 240, iters: 2, good: 64, grace: 16, blockSize: 262144, mode: 'all' };
 const Z9 = { level: 9, memLevel: 9 };
 for (const id of readdirSync(I).sort()) {
   const image = decodePng(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
